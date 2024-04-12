@@ -14,7 +14,7 @@
 #include "esp_app_format.h"
 
 // WIFI configuration
-#define ESP_WIFI_SSID      "ESP32-OTA-AP"  // for user change
+#define ESP_WIFI_SSID      "ESP32_OTA_AP"  // for user change
 #define ESP_WIFI_PASS      "dupa123456789" // for user change
 #define ESP_WIFI_CHANNEL   1
 #define MAX_STA_CONN       1
@@ -23,14 +23,19 @@
 #define FIRMWARE_UPG_URL "https://192.168.4.2:8070/RGB_blink.bin" // for user change (it has to match with ca_cert.pem)
 #define OTA_RECV_TIMEOUT 5000
 
+#define SSL_SERVER 1 // uncomment when using SSL server
+
 #define BUFFSIZE 1024
 #define HASH_LEN 32 // SHA-256 digest length
 #define OTA_URL_SIZE 256
+#define AP_MAX_POLLS 60
 
 // an ota data write buffer ready to write to the flash
 static char ota_write_data[BUFFSIZE + 1] = {0};
 extern const uint8_t server_cert_pem_start[] asm("_binary_ca_cert_pem_start");
 extern const uint8_t server_cert_pem_end[] asm("_binary_ca_cert_pem_end");
+
+static bool AP_connected = false;
 
 static const char* TAG = "esp_ota_ap";
 
@@ -39,7 +44,7 @@ static void print_sha256(const uint8_t* image_hash, const char* label)
 {
     char hash_print[HASH_LEN * 2 + 1];
     hash_print[HASH_LEN * 2] = 0;
-    for (int i = 0; i < HASH_LEN; ++i)
+    for (uint32_t i = 0; i < HASH_LEN; ++i)
         sprintf(&hash_print[i * 2], "%02x", image_hash[i]);
 
     ESP_LOGI(TAG, "%s: %s", label, hash_print);
@@ -67,17 +72,22 @@ static bool diagnostic(void)
     return true;
 }
 
+
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
 {
     if (event_id == WIFI_EVENT_AP_STACONNECTED)
     {
         wifi_event_ap_staconnected_t* event = (wifi_event_ap_staconnected_t*)event_data;
         ESP_LOGI(TAG, "station "MACSTR" join, AID=%d", MAC2STR(event->mac), event->aid);
+
+        AP_connected = true;
     }
     else if (event_id == WIFI_EVENT_AP_STADISCONNECTED)
     {
         wifi_event_ap_stadisconnected_t* event = (wifi_event_ap_stadisconnected_t*)event_data;
         ESP_LOGI(TAG, "station "MACSTR" leave, AID=%d", MAC2STR(event->mac), event->aid);
+
+        AP_connected = false;
     }
 }
 
@@ -105,6 +115,7 @@ static void infinite_loop(void)
 {
     int i = 0;
     ESP_LOGI(TAG, "When a new firmware is available on the server, press the reset button to download it");
+
     while(1)
     {
         ESP_LOGI(TAG, "Waiting for a new firmware ... %d", ++i);
@@ -203,14 +214,6 @@ static void ota_example_task(void* pvParameter)
                             infinite_loop();
                         }
                     }
-// #ifndef CONFIG_EXAMPLE_SKIP_VERSION_CHECK
-//                     if (memcmp(new_app_info.version, running_app_info.version, sizeof(new_app_info.version)) == 0)
-//                     {
-//                         ESP_LOGW(TAG, "Current running version is the same as a new. We will not continue the update.");
-//                         http_cleanup(client);
-//                         infinite_loop();
-//                     }
-// #endif
 
                     image_header_was_checked = true;
 
@@ -261,8 +264,17 @@ static void ota_example_task(void* pvParameter)
                 break;
             }
         }
+
+#ifdef SSL_SERVER
+        if (data_read >= 0 && data_read < BUFFSIZE)
+        {
+            ESP_LOGI(TAG, "Connection closed, all data received");
+            break;
+        }
+#endif // SSL_SERVER
     }
 
+#ifndef SSL_SERVER
     ESP_LOGI(TAG, "Total Write binary data length: %d", binary_file_length);
     if (esp_http_client_is_complete_data_received(client) != true)
     {
@@ -271,6 +283,7 @@ static void ota_example_task(void* pvParameter)
         esp_ota_abort(update_handle);
         task_fatal_error();
     }
+#endif // SSL_SERVER
 
     err = esp_ota_end(update_handle);
     if (err != ESP_OK)
@@ -403,6 +416,22 @@ void app_main(void)
     // initialize WIFI AP
     wifi_init_softap();
 
+    // wait for PC to connect to the AP
+    uint32_t AP_polls = 1;
+    while (AP_connected == false)
+    {
+        ESP_LOGI(TAG, "Waiting for PC to connect to the AP (%lu/%d) ...", AP_polls, AP_MAX_POLLS);
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+
+        AP_polls++;
+        if (AP_polls > AP_MAX_POLLS)
+        {
+            ESP_LOGE(TAG, "No PC connected to the AP. Restarting ...");
+            esp_restart();
+        }
+    }
+
+    // start OTA task
     xTaskCreate(&ota_example_task, "ota_task", 8192, NULL, 5, NULL);
 
     while (1)

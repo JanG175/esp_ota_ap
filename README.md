@@ -3,7 +3,7 @@ This code enables to pragram your ESP32 via WIFI AP hosted on the ESP32 itself.
 
 ## Create certificate and start a server
 Use:
-```bash
+```shell
 bash create_cert_and_server.sh
 ```
 to create a certificate, copy it to the workspace directory and start a SSL server.
