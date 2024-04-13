@@ -24,8 +24,13 @@ bash create_cert_and_server.sh
 to create a certificate, copy it to the workspace directory and start the SSL server.
 
 First time ca_cert.pem creation:
-![image](images/cert.gif)
-
+* Country Name (2 letter code) [AU]:PL
+* State or Province Name (full name) [Some-State]:Pomorskie
+* Locality Name (eg, city) []:Gdansk
+* Organization Name (eg, company) [Internet Widgits Pty Ltd]:Home
+* Organizational Unit Name (eg, section) []:com
+* Common Name (e.g. server FQDN or YOUR name) []:192.168.4.2
+* Email Address []: jg@gmail.com
 
 ## Sources
 * https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/ota.html
