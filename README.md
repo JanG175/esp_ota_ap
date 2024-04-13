@@ -13,7 +13,7 @@ This code enables to pragram the ESP32 OTA via WIFI AP hosted on the ESP32 itsel
 
 ## Notes
 * Uncomment `#define SSL_SERVER 1       // uncomment while using SSL server` in `main/main.c` while using the SSL server.
-* Comment out `#define SKIP_VERSION_CHECK // uncomment to skip version check` in `main/main.c` to enable version check during the update.
+* Comment out `#define SKIP_VERSION_CHECK // uncomment to skip version check` in `main/main.c` to enable a version check during the update.
 * A Python server handler should be added in the future.
 
 ## Create certificate and start a server [bash]

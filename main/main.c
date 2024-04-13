@@ -1,3 +1,11 @@
+/**
+ * @file main.c
+ * @author JanG175
+ * @brief ESP32 OTA over AP
+ * 
+ * @copyright Apache 2.0
+ */
+
 #include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
