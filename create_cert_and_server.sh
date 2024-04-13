@@ -4,7 +4,7 @@
 workspace=$( pwd )
 
 # set desired project path
-path="/home/jang175/esp/esp-projects/RGB_blink"
+path="/home/jang175/esp/esp-projects/RGB_blink" # change this to your desired project path
 
 # go to desired project path
 cd "$path/build"

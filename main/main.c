@@ -12,34 +12,44 @@
 #include "esp_mac.h"
 #include "esp_http_client.h"
 #include "esp_app_format.h"
+#include "esp_partition.h"
+#include "esp_flash_partitions.h"
 
 // WIFI configuration
 #define ESP_WIFI_SSID      "ESP32_OTA_AP"  // for user change
-#define ESP_WIFI_PASS      "dupa123456789" // for user change
+#define ESP_WIFI_PASS      "esp32_ota_ap" // for user change
 #define ESP_WIFI_CHANNEL   1
 #define MAX_STA_CONN       1
 
 // HTTPS configuration
 #define FIRMWARE_UPG_URL "https://192.168.4.2:8070/RGB_blink.bin" // for user change (it has to match with ca_cert.pem)
+
+#define SSL_SERVER 1       // uncomment while using SSL server
+#define SKIP_VERSION_CHECK // uncomment to skip version check
+
+#define AP_MAX_POLLS 30
 #define OTA_RECV_TIMEOUT 5000
-
-#define SSL_SERVER 1 // uncomment when using SSL server
-
 #define BUFFSIZE 1024
 #define HASH_LEN 32 // SHA-256 digest length
 #define OTA_URL_SIZE 256
-#define AP_MAX_POLLS 60
 
 // an ota data write buffer ready to write to the flash
 static char ota_write_data[BUFFSIZE + 1] = {0};
 extern const uint8_t server_cert_pem_start[] asm("_binary_ca_cert_pem_start");
 extern const uint8_t server_cert_pem_end[] asm("_binary_ca_cert_pem_end");
 
+static portMUX_TYPE spinlock = portMUX_INITIALIZER_UNLOCKED;
 static bool AP_connected = false;
 
 static const char* TAG = "esp_ota_ap";
 
 
+/**
+ * @brief print sha256 hash
+ * 
+ * @param image_hash sha256 hash
+ * @param label label
+*/
 static void print_sha256(const uint8_t* image_hash, const char* label)
 {
     char hash_print[HASH_LEN * 2 + 1];
@@ -51,28 +61,14 @@ static void print_sha256(const uint8_t* image_hash, const char* label)
 }
 
 
-static bool diagnostic(void)
-{
-    // gpio_config_t io_conf;
-    // io_conf.intr_type    = GPIO_INTR_DISABLE;
-    // io_conf.mode         = GPIO_MODE_INPUT;
-    // io_conf.pin_bit_mask = (1ULL << CONFIG_EXAMPLE_GPIO_DIAGNOSTIC);
-    // io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    // io_conf.pull_up_en   = GPIO_PULLUP_ENABLE;
-    // gpio_config(&io_conf);
-
-    // ESP_LOGI(TAG, "Diagnostics (5 sec)...");
-    // vTaskDelay(5000 / portTICK_PERIOD_MS);
-
-    // bool diagnostic_is_ok = gpio_get_level(CONFIG_EXAMPLE_GPIO_DIAGNOSTIC);
-
-    // gpio_reset_pin(CONFIG_EXAMPLE_GPIO_DIAGNOSTIC);
-    // return diagnostic_is_ok;
-
-    return true;
-}
-
-
+/**
+ * @brief WIFI event handler
+ * 
+ * @param arg event handler arguments
+ * @param event_base event base
+ * @param event_id event id
+ * @param event_data event data
+*/
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
 {
     if (event_id == WIFI_EVENT_AP_STACONNECTED)
@@ -80,18 +76,27 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
         wifi_event_ap_staconnected_t* event = (wifi_event_ap_staconnected_t*)event_data;
         ESP_LOGI(TAG, "station "MACSTR" join, AID=%d", MAC2STR(event->mac), event->aid);
 
+        portENTER_CRITICAL(&spinlock);
         AP_connected = true;
+        portEXIT_CRITICAL(&spinlock);
     }
     else if (event_id == WIFI_EVENT_AP_STADISCONNECTED)
     {
         wifi_event_ap_stadisconnected_t* event = (wifi_event_ap_stadisconnected_t*)event_data;
         ESP_LOGI(TAG, "station "MACSTR" leave, AID=%d", MAC2STR(event->mac), event->aid);
 
+        portENTER_CRITICAL(&spinlock);
         AP_connected = false;
+        portENTER_CRITICAL(&spinlock);
     }
 }
 
 
+/**
+ * @brief HTTP cleanup
+ * 
+ * @param client http client handle
+*/
 static void http_cleanup(esp_http_client_handle_t client)
 {
     esp_http_client_close(client);
@@ -99,32 +104,41 @@ static void http_cleanup(esp_http_client_handle_t client)
 }
 
 
-static void __attribute__((noreturn)) task_fatal_error(void)
+/**
+ * @brief reset ESP32 to the last valid app
+*/
+static void reset_to_last_valid_app(void)
+{
+    const esp_partition_t* last_valid_app = esp_ota_get_last_invalid_partition();
+    esp_err_t err = esp_ota_set_boot_partition(last_valid_app);
+
+    if (err != ESP_OK)
+        ESP_LOGE(TAG, "esp_ota_set_boot_partition failed (%s)!", esp_err_to_name(err));
+
+    esp_restart();
+}
+
+
+/**
+ * @brief task fatal error handler
+*/
+static void task_fatal_error(void)
 {
     ESP_LOGE(TAG, "Exiting task due to fatal error...");
-    (void)vTaskDelete(NULL);
+    vTaskDelay(5000 / portTICK_PERIOD_MS);
 
-    while (1)
-    {
-        ;
-    }
+    reset_to_last_valid_app();
+
+    vTaskDelete(NULL);
 }
 
 
-static void infinite_loop(void)
-{
-    int i = 0;
-    ESP_LOGI(TAG, "When a new firmware is available on the server, press the reset button to download it");
-
-    while(1)
-    {
-        ESP_LOGI(TAG, "Waiting for a new firmware ... %d", ++i);
-        vTaskDelay(2000 / portTICK_PERIOD_MS);
-    }
-}
-
-
-static void ota_example_task(void* pvParameter)
+/**
+ * @brief ota update task
+ * 
+ * @param pvParameter task arguments
+*/
+static void ota_task(void* pvParameter)
 {
     esp_err_t err;
     // update handle: set by esp_ota_begin(), must be freed via esp_ota_end()
@@ -173,6 +187,7 @@ static void ota_example_task(void* pvParameter)
     int binary_file_length = 0;
     // deal with all receive packet
     bool image_header_was_checked = false;
+
     while (1)
     {
         int data_read = esp_http_client_read(client, ota_write_data, BUFFSIZE);
@@ -202,6 +217,7 @@ static void ota_example_task(void* pvParameter)
                     if (esp_ota_get_partition_description(last_invalid_app, &invalid_app_info) == ESP_OK)
                         ESP_LOGI(TAG, "Last invalid firmware version: %s", invalid_app_info.version);
 
+#ifndef SKIP_VERSION_CHECK
                     // check current version with last invalid partition
                     if (last_invalid_app != NULL)
                     {
@@ -211,9 +227,15 @@ static void ota_example_task(void* pvParameter)
                             ESP_LOGW(TAG, "Previously, there was an attempt to launch the firmware with %s version, but it failed.", invalid_app_info.version);
                             ESP_LOGW(TAG, "The firmware has been rolled back to the previous version.");
                             http_cleanup(client);
-                            infinite_loop();
+                            task_fatal_error();
                         }
                     }
+#else
+                    if (memcmp(new_app_info.version, running_app_info.version, sizeof(new_app_info.version)) == 0)
+                    {
+                        ESP_LOGW(TAG, "Current running version is the same as a new!");
+                    }
+#endif // SKIP_VERSION_CHECK
 
                     image_header_was_checked = true;
 
@@ -236,7 +258,7 @@ static void ota_example_task(void* pvParameter)
                 }
             }
 
-            err = esp_ota_write( update_handle, (const void*)ota_write_data, data_read);
+            err = esp_ota_write(update_handle, (const void*)ota_write_data, data_read);
             if (err != ESP_OK)
             {
                 http_cleanup(client);
@@ -266,6 +288,7 @@ static void ota_example_task(void* pvParameter)
         }
 
 #ifdef SSL_SERVER
+        // SSL server cannot check if the complete data was send by HTTP
         if (data_read >= 0 && data_read < BUFFSIZE)
         {
             ESP_LOGI(TAG, "Connection closed, all data received");
@@ -312,6 +335,9 @@ static void ota_example_task(void* pvParameter)
 }
 
 
+/**
+ * @brief init WIFI AP
+*/
 void wifi_init_softap(void)
 {
     ESP_ERROR_CHECK(esp_netif_init());
@@ -354,6 +380,9 @@ void wifi_init_softap(void)
 }
 
 
+/**
+ * @brief main function
+*/
 void app_main(void)
 {
     uint8_t sha_256[HASH_LEN] = {0};
@@ -377,28 +406,6 @@ void app_main(void)
     esp_partition_get_sha256(esp_ota_get_running_partition(), sha_256);
     print_sha256(sha_256, "SHA-256 for current firmware: ");
 
-    // rollback
-    const esp_partition_t* running = esp_ota_get_running_partition();
-    esp_ota_img_states_t ota_state;
-    if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK)
-    {
-        if (ota_state == ESP_OTA_IMG_PENDING_VERIFY)
-        {
-            // run diagnostic function
-            bool diagnostic_is_ok = diagnostic();
-            if (diagnostic_is_ok)
-            {
-                ESP_LOGI(TAG, "Diagnostics completed successfully! Continuing execution ...");
-                esp_ota_mark_app_valid_cancel_rollback();
-            }
-            else
-            {
-                ESP_LOGE(TAG, "Diagnostics failed! Start rollback to the previous version ...");
-                esp_ota_mark_app_invalid_rollback_and_reboot();
-            }
-        }
-    }
-
     // initialize NVS
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND)
@@ -416,26 +423,43 @@ void app_main(void)
     // initialize WIFI AP
     wifi_init_softap();
 
-    // wait for PC to connect to the AP
+    // wait for a PC to connect to the AP
     uint32_t AP_polls = 1;
     while (AP_connected == false)
     {
-        ESP_LOGI(TAG, "Waiting for PC to connect to the AP (%lu/%d) ...", AP_polls, AP_MAX_POLLS);
+        ESP_LOGI(TAG, "Waiting for a PC to connect to the AP (%lu/%d) ...", AP_polls, AP_MAX_POLLS);
+        AP_polls++;
         vTaskDelay(1000 / portTICK_PERIOD_MS);
 
-        AP_polls++;
         if (AP_polls > AP_MAX_POLLS)
         {
             ESP_LOGE(TAG, "No PC connected to the AP. Restarting ...");
-            esp_restart();
+            
+            // if no PC is connected to the AP, rollback to the last working program
+            reset_to_last_valid_app();
+        }
+    }
+
+    /*
+     * Treat successful WiFi connection as a checkpoint to cancel rollback
+     * process and mark newly updated firmware image as active.
+     */
+    const esp_partition_t* running = esp_ota_get_running_partition();
+    esp_ota_img_states_t ota_state;
+    if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK)
+    {
+        if (ota_state == ESP_OTA_IMG_PENDING_VERIFY)
+        {
+            if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK)
+                ESP_LOGI(TAG, "App is valid, rollback cancelled successfully");
+            else
+            {
+                ESP_LOGE(TAG, "Failed to cancel rollback");
+                esp_ota_mark_app_invalid_rollback_and_reboot();
+            }
         }
     }
 
     // start OTA task
-    xTaskCreate(&ota_example_task, "ota_task", 8192, NULL, 5, NULL);
-
-    while (1)
-    {
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
-    }
+    xTaskCreate(&ota_task, "ota_task", 8192, NULL, 5, NULL);
 }
